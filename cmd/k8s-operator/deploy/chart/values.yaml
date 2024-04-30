@@ -23,6 +23,7 @@ operatorConfig:
     - "tag:k8s-operator"
 
   image:
+    # Repo defaults to DockerHub, but images are also synced to ghcr.io/tailscale/k8s-operator.
     repo: tailscale/k8s-operator
     # Digest will be prioritized over tag. If neither are set appVersion will be
     # used.
@@ -52,6 +53,7 @@ operatorConfig:
 # https://tailscale.com/kb/1236/kubernetes-operator/#cluster-egress
 proxyConfig:
   image:
+    # Repo defaults to DockerHub, but images are also synced to ghcr.io/tailscale/tailscale.
     repo: tailscale/tailscale
     # Digest will be prioritized over tag. If neither are set appVersion will be
     # used.
