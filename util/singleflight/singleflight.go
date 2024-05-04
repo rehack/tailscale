@@ -20,11 +20,13 @@ package singleflight // import "tailscale.com/util/singleflight"
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 )
 
 // errGoexit indicates the runtime.Goexit was called in
@@ -69,6 +71,11 @@ type call[V any] struct {
 	// not written after the WaitGroup is done.
 	dups  int
 	chans []chan<- Result[V]
+
+	// These fields are only written when the call is being created, and
+	// only in the DoChanContext method.
+	cancel     context.CancelFunc
+	ctxWaiters atomic.Int64
 }
 
 // Group represents a class of work and forms a namespace in
@@ -141,6 +148,86 @@ func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
 	go g.doCall(c, key, fn)
 
 	return ch
+}
+
+// DoChanContext is like DoChan, but supports context cancelation. The context
+// passed to the fn function is a context that is canceled only when there are
+// no callers waiting on a result (i.e. all callers have canceled their
+// contexts).
+func (g *Group[K, V]) DoChanContext(ctx context.Context, key K, fn func(context.Context) (V, error)) <-chan Result[V] {
+	ch := make(chan Result[V], 1)
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[K]*call[V])
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		c.ctxWaiters.Add(1)
+		c.chans = append(c.chans, ch)
+		g.mu.Unlock()
+
+		// Instead of returning the channel directly, we need to track
+		// when the call finishes so we can handle context cancelation.
+		// Do so by creating an final channel that gets the
+		// result and hooking that up to the wait function.
+		final := make(chan Result[V], 1)
+		go g.waitCtx(ctx, c, ch, final)
+		return final
+	}
+	// Create a context that is not canceled when the parent context is,
+	// but otherwise propagates all values.
+	callCtx, callCancel := context.WithCancel(context.WithoutCancel(ctx))
+	c := &call[V]{
+		chans:  []chan<- Result[V]{ch},
+		cancel: callCancel,
+	}
+	c.wg.Add(1)
+	c.ctxWaiters.Add(1) // one caller waiting
+	g.m[key] = c
+	g.mu.Unlock()
+
+	// Wrap our function to provide the context.
+	go g.doCall(c, key, func() (V, error) {
+		return fn(callCtx)
+	})
+
+	final := make(chan Result[V], 1)
+	go g.waitCtx(ctx, c, ch, final)
+	return final
+}
+
+// waitCtx will wait on the provided call to finish, or the context to be done.
+// If the context is done, and this is the last waiter, then the context
+// provided to the underlying function will be canceled.
+func (g *Group[K, V]) waitCtx(ctx context.Context, c *call[V], result <-chan Result[V], output chan<- Result[V]) {
+	var (
+		res Result[V]
+		err error
+	)
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case res = <-result:
+	}
+
+	// Decrement the caller count, and if we're the last one, cancel the
+	// context we created. Do this in all cases, error and otherwise, so we
+	// don't leak goroutines.
+	//
+	// Also wait on the call to finish, so we know that the call has
+	// finished executing after the last caller has returned.
+	if c.ctxWaiters.Add(-1) == 0 {
+		c.cancel()
+		c.wg.Wait()
+	}
+
+	// Send the result to the caller; if the error was non-nil, we send
+	// that, otherwise we send the result we got.
+	if err != nil {
+		output <- Result[V]{Err: err}
+	} else {
+		output <- res
+	}
 }
 
 // doCall handles the single call for a key.
