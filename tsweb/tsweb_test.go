@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"tailscale.com/tstest"
 	"tailscale.com/util/must"
 	"tailscale.com/util/vizerror"
@@ -277,6 +278,29 @@ func TestStdHandler(t *testing.T) {
 		},
 
 		{
+			name: "handler returns JSON-formatted HTTPError",
+			rh: ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				h := Error(http.StatusBadRequest, `{"isjson": true}`, errors.New("uh"))
+				h.Header = http.Header{"Content-Type": {"application/json"}}
+				return h
+			}),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 400,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        `{"isjson": true}: uh`,
+				Code:       400,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: `{"isjson": true}`,
+		},
+
+		{
 			name:     "handler returns user-visible error wrapped by private error with request ID",
 			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
 			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
@@ -310,7 +334,7 @@ func TestStdHandler(t *testing.T) {
 				Err:        testErr.Error(),
 				Code:       500,
 			},
-			wantBody: "internal server error\n",
+			wantBody: "Internal Server Error\n",
 		},
 
 		{
@@ -329,7 +353,7 @@ func TestStdHandler(t *testing.T) {
 				Code:       500,
 				RequestID:  exampleRequestID,
 			},
-			wantBody: "internal server error\n" + exampleRequestID + "\n",
+			wantBody: "Internal Server Error\n" + exampleRequestID + "\n",
 		},
 
 		{
@@ -438,7 +462,7 @@ func TestStdHandler(t *testing.T) {
 				TLS:        false,
 				Host:       "example.com",
 				Method:     "GET",
-				Code:       404,
+				Code:       200,
 				Err:        "not found",
 				RequestURI: "/",
 			},
@@ -461,12 +485,43 @@ func TestStdHandler(t *testing.T) {
 				TLS:        false,
 				Host:       "example.com",
 				Method:     "GET",
-				Code:       404,
+				Code:       200,
 				Err:        "not found",
 				RequestURI: "/",
 				RequestID:  exampleRequestID,
 			},
 			wantBody: "not found with request ID " + exampleRequestID + "\n",
+		},
+
+		{
+			name: "nested",
+			rh: ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				StdHandler(ReturnHandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+					return Error(501, "Not Implemented", errors.New("uhoh"))
+				}), HandlerOptions{
+					OnError: func(w http.ResponseWriter, r *http.Request, h HTTPError) {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(h.Code)
+						fmt.Fprintf(w, `{"error": %q}`, h.Msg)
+					},
+				}).ServeHTTP(w, r)
+				return nil
+			}),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/"),
+			wantCode: 501,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       501,
+				Err:        "Not Implemented: uhoh",
+				RequestURI: "/",
+				RequestID:  exampleRequestID,
+			},
+			wantBody: `{"error": "Not Implemented"}`,
 		},
 	}
 
@@ -496,17 +551,11 @@ func TestStdHandler(t *testing.T) {
 				t.Errorf("handler didn't write a request log")
 				return
 			}
-			errTransform := cmp.Transformer("err", func(e error) string {
-				if e == nil {
-					return ""
-				}
-				return e.Error()
-			})
-			if diff := cmp.Diff(logs[0], test.wantLog, errTransform); diff != "" {
-				t.Errorf("handler wrote incorrect request log (-got+want):\n%s", diff)
+			if diff := cmp.Diff(logs[0], test.wantLog, cmpopts.IgnoreFields(AccessLogRecord{}, "Bytes")); diff != "" {
+				t.Errorf("handler wrote incorrect request log (-got +want):\n%s", diff)
 			}
 			if diff := cmp.Diff(rec.Body.String(), test.wantBody); diff != "" {
-				t.Errorf("handler wrote incorrect body (-got+want):\n%s", diff)
+				t.Errorf("handler wrote incorrect body (-got +want):\n%s", diff)
 			}
 		})
 	}
