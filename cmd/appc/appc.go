@@ -31,7 +31,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
-	"tailscale.com/types/nettype"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 )
@@ -138,13 +137,13 @@ func run(ctx context.Context, hostname string, debugPort int, siteID uint16, v4P
 		}()
 	}
 
-	ln, err := ts.Listen("udp", dnsAddr.String()+":53")
+	pc, err := ts.ListenPacket("udp4", dnsAddr.String()+":53")
 	if err != nil {
 		log.Fatalf("failed listening on port 53: %v", err)
 	}
-	defer ln.Close()
-	log.Printf("Listening for DNS on %s", ln.Addr())
-	c.serveDNS(ln)
+	defer pc.Close()
+	log.Printf("Listening for DNS on %s", pc.LocalAddr())
+	c.serveDNS(pc)
 }
 
 type connector struct {
@@ -164,14 +163,15 @@ type connector struct {
 	perPeerMap syncs.Map[tailcfg.NodeID, *perPeerState]
 }
 
-func (c *connector) serveDNS(ln net.Listener) {
+func (c *connector) serveDNS(pc net.PacketConn) {
 	for {
-		conn, err := ln.Accept()
+		buf := make([]byte, 1500)
+		n, remoteAddr, err := pc.ReadFrom(buf)
 		if err != nil {
-			log.Printf("serveDNS accept: %v", err)
+			log.Printf("HandleDNS: read failed: %v\n ", err)
 			return
 		}
-		go c.handleDNS(conn.(nettype.ConnPacketConn))
+		go c.handleDNS(pc, remoteAddr, buf[:n])
 	}
 }
 
@@ -186,27 +186,17 @@ func (c *connector) serveDNS(ln net.Listener) {
 //
 // This assignment later allows the connector to determine where to forward
 // traffic based on the destination IP address.
-func (c *connector) handleDNS(conn nettype.ConnPacketConn) {
-	defer conn.Close()
+func (c *connector) handleDNS(pc net.PacketConn, remoteAddr net.Addr, buf []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	remoteAddr := conn.RemoteAddr().(*net.UDPAddr).AddrPort()
 	who, err := c.lc.WhoIs(ctx, remoteAddr.String())
 	if err != nil {
 		log.Printf("HandleDNS: WhoIs failed: %v\n", err)
 		return
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	if err != nil {
-		log.Printf("HandleDNS: read failed: %v\n ", err)
-		return
-	}
 
 	var msg dnsmessage.Message
-	err = msg.Unpack(buf[:n])
+	err = msg.Unpack(buf)
 	if err != nil {
 		log.Printf("HandleDNS: dnsmessage unpack failed: %v\n ", err)
 		return
@@ -221,7 +211,7 @@ func (c *connector) handleDNS(conn nettype.ConnPacketConn) {
 		return
 	}
 	// This connector handled the DNS request
-	_, err = conn.Write(resp)
+	_, err = pc.WriteTo(resp, remoteAddr)
 	if err != nil {
 		log.Printf("HandleDNS: write failed: %v\n", err)
 	}
