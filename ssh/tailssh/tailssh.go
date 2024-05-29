@@ -1485,13 +1485,12 @@ type CastHeader struct {
 	ConnectionID string `json:"connectionID"`
 }
 
-// sessionRecordingClient returns an http.Client that uses srv.lb.Dialer() to
-// dial connections. This is used to make requests to the session recording
-// server to upload session recordings.
-// It uses the provided dialCtx to dial connections, and limits a single dial
-// to 5 seconds.
-func (ss *sshSession) sessionRecordingClient(dialCtx context.Context) (*http.Client, error) {
-	dialer := ss.conn.srv.lb.Dialer()
+// SessionRecordingClientForDialer returns an http.Client that uses a clone of
+// the provided Dialer's PeerTransport to dial connections. This is used to make
+// requests to the session recording server to upload session recordings. It
+// uses the provided dialCtx to dial connections, and limits a single dial to 5
+// seconds.
+func SessionRecordingClientForDialer(dialCtx context.Context, dialer *tsdial.Dialer) (*http.Client, error) {
 	if dialer == nil {
 		return nil, errors.New("no peer API transport")
 	}
@@ -1515,7 +1514,7 @@ func (ss *sshSession) sessionRecordingClient(dialCtx context.Context) (*http.Cli
 	}, nil
 }
 
-// connectToRecorder connects to the recorder at any of the provided addresses.
+// ConnectToRecorder connects to the recorder at any of the provided addresses.
 // It returns the first successful response, or a multierr if all attempts fail.
 //
 // On success, it returns a WriteCloser that can be used to upload the
@@ -1527,7 +1526,7 @@ func (ss *sshSession) sessionRecordingClient(dialCtx context.Context) (*http.Cli
 // attempts are in order the recorder(s) was attempted. If successful a
 // successful connection is made, the last attempt in the slice is the
 // attempt for connected recorder.
-func (ss *sshSession) connectToRecorder(ctx context.Context, recs []netip.AddrPort) (io.WriteCloser, []*tailcfg.SSHRecordingAttempt, <-chan error, error) {
+func ConnectToRecorder(ctx context.Context, recs []netip.AddrPort, dialer *tsdial.Dialer) (io.WriteCloser, []*tailcfg.SSHRecordingAttempt, <-chan error, error) {
 	if len(recs) == 0 {
 		return nil, nil, nil, errors.New("no recorders configured")
 	}
@@ -1536,7 +1535,7 @@ func (ss *sshSession) connectToRecorder(ctx context.Context, recs []netip.AddrPo
 	// unbounded context for the upload.
 	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer dialCancel()
-	hc, err := ss.sessionRecordingClient(dialCtx)
+	hc, err := SessionRecordingClientForDialer(dialCtx, dialer)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1672,7 +1671,7 @@ func (ss *sshSession) startNewRecording() (_ *recording, err error) {
 	} else {
 		var errChan <-chan error
 		var attempts []*tailcfg.SSHRecordingAttempt
-		rec.out, attempts, errChan, err = ss.connectToRecorder(ctx, recorders)
+		rec.out, attempts, errChan, err = ConnectToRecorder(ctx, recorders, ss.conn.srv.lb.Dialer())
 		if err != nil {
 			if onFailure != nil && onFailure.NotifyURL != "" && len(attempts) > 0 {
 				eventType := tailcfg.SSHSessionRecordingFailed
