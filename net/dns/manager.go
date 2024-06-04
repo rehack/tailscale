@@ -50,9 +50,10 @@ type Manager struct {
 	ctx       context.Context    // good until Down
 	ctxCancel context.CancelFunc // closes ctx
 
-	resolver *resolver.Resolver
-	os       OSConfigurator
-	goos     string // if empty, gets set to runtime.GOOS
+	resolver                    *resolver.Resolver
+	os                          OSConfigurator
+	disableSplitDNSOptimization bool   // set via controlknob to disable split DNS optimization on iOS
+	goos                        string // if empty, gets set to runtime.GOOS
 }
 
 // NewManagers created a new manager from the given config.
@@ -67,12 +68,19 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, 
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+
+	disableSplitDNSOptimization := false
+	if knobs != nil {
+		disableSplitDNSOptimization = knobs.DisableSplitDNSWhenNoCustomResolvers.Load()
+	}
+
 	m := &Manager{
-		logf:     logf,
-		resolver: resolver.New(logf, linkSel, dialer, knobs),
-		os:       oscfg,
-		health:   health,
-		goos:     goos,
+		logf:                        logf,
+		resolver:                    resolver.New(logf, linkSel, dialer, knobs),
+		os:                          oscfg,
+		health:                      health,
+		disableSplitDNSOptimization: disableSplitDNSOptimization,
+		goos:                        goos,
 	}
 	m.ctx, m.ctxCancel = context.WithCancel(context.Background())
 	m.logf("using %T", m.os)
@@ -273,8 +281,12 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		// a query for 'work-laptop' might lead to search domain expansion, resolving
 		// as 'work-laptop.aws.com' for example.
 		if m.goos == "ios" && rcfg.RoutesRequireNoCustomResolvers() {
-			for r := range rcfg.Routes {
-				ocfg.MatchDomains = append(ocfg.MatchDomains, r)
+			if !m.disableSplitDNSOptimization {
+				for r := range rcfg.Routes {
+					ocfg.MatchDomains = append(ocfg.MatchDomains, r)
+				}
+			} else {
+				m.logf("iOS split DNS is disabled by nodeattr")
 			}
 		}
 		var defaultRoutes []*dnstype.Resolver
